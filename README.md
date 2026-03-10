@@ -42,7 +42,7 @@ Sin dependencias de terceros — solo stdlib de Python.
 ## Instalación y uso
 
 ```bash
-git clone https://github.com/TU_USUARIO/sd-hik-reader.git
+git clone https://github.com/Eddie2k06/sd-hik-reader.git
 cd sd-hik-reader
 python main.py
 ```
