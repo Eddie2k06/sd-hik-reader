@@ -15,10 +15,14 @@ Ventanas secundarias:
 import logging
 import os
 import threading
+import time
 import tkinter as tk
+from datetime import datetime
 from tkinter import ttk, filedialog, messagebox
+from typing import List, Optional
 
 from core import config
+from core import deps_check
 from core import drives as drives_mod
 from core import ffmpeg_setup
 
@@ -29,8 +33,8 @@ from core.formatter import (
 )
 from core.hashing import (
     ALL_ALGORITHMS, DEFAULT_EXCLUDE_SUFFIXES, HashCancelled, HashProgress,
-    build_hash_entries, collect_files, count_subfolders,
-    write_hash_report, write_hash_report_pdf,
+    ReportlabInstallError, build_hash_entries, collect_files, count_subfolders,
+    install_reportlab, write_hash_report, write_hash_report_pdf,
 )
 
 
@@ -1134,6 +1138,278 @@ class FormatDialog(tk.Toplevel):
 
 
 # ==========================================================================
+# Ventana flotante de progreso de descarga/extracción
+# ==========================================================================
+class DownloadOptionsDialog(tk.Toplevel):
+    """Paso previo a la descarga: cuántos clips se van a bajar (de
+    cuántos hay cargados), el rango de fechas que cubren, carpeta de
+    destino, y dos opciones (crear una subcarpeta por fecha, crear
+    hash automáticamente al terminar). 'Iniciar' llama a on_start(...)
+    con lo elegido; el caller es quien arranca la descarga en sí."""
+
+    def __init__(self, parent, total_to_download: int, total_loaded: int,
+                 date_min: Optional[datetime], date_max: Optional[datetime],
+                 initial_dir: str = "", on_start=None):
+        super().__init__(parent)
+        _ensure_styles()
+        self.title("Descargar clips")
+        self.configure(bg=C_PAGE)
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+
+        self.total_to_download = total_to_download
+        self.total_loaded = total_loaded
+        self.date_min = date_min
+        self.date_max = date_max
+        self.on_start = on_start
+
+        self.dir_var = tk.StringVar(value=initial_dir or "")
+        self.subfolder_var = tk.BooleanVar(value=True)
+        self.hash_var = tk.BooleanVar(value=True)
+
+        self.container = tk.Frame(self, bg=C_PAGE, padx=18, pady=14)
+        self.container.pack(fill='both', expand=True)
+        self._build()
+        center_window(self, parent)
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+
+    def _build(self):
+        frame = self.container
+        tk.Label(frame, text="⬇ Descargar clips", bg=C_PAGE, fg=C_TEXT,
+                 font=FONT_TITLE).pack(anchor='w', pady=(0, 10))
+
+        outer, card = _card(frame)
+        outer.pack(fill='x', pady=(0, 12))
+        _kv_row(card, "Archivos a descargar", f"{self.total_to_download} de {self.total_loaded}")
+        if self.date_min and self.date_max:
+            if self.date_min.date() == self.date_max.date():
+                fechas = self.date_min.strftime('%d/%m/%y')
+            else:
+                fechas = f"{self.date_min.strftime('%d/%m/%y')} - {self.date_max.strftime('%d/%m/%y')}"
+            _kv_row(card, "Fechas", fechas)
+
+        _section_title(frame, "Carpeta de descarga")
+        dir_row = tk.Frame(frame, bg=C_PAGE)
+        dir_row.pack(fill='x', pady=(0, 4))
+        ttk.Entry(dir_row, textvariable=self.dir_var, width=42).pack(side='left', fill='x', expand=True)
+        ttk.Button(dir_row, text="📁 Seleccionar", command=self._browse_dir).pack(side='left', padx=(6, 0))
+
+        self.error_lbl = tk.Label(frame, bg=C_PAGE, fg=C_DANGER, font=FONT_SMALL,
+                                   wraplength=420, justify='left', text="")
+        self.error_lbl.pack(anchor='w', pady=(2, 0))
+
+        _section_title(frame, "Opciones")
+        tk.Checkbutton(
+            frame, text="Crear carpeta por fecha (día)", variable=self.subfolder_var,
+            bg=C_PAGE, fg=C_TEXT, font=FONT_BASE, activebackground=C_PAGE, selectcolor=C_PANEL,
+        ).pack(anchor='w', pady=1)
+        tk.Checkbutton(
+            frame, text="Crear Hash al finalizar", variable=self.hash_var,
+            bg=C_PAGE, fg=C_TEXT, font=FONT_BASE, activebackground=C_PAGE, selectcolor=C_PANEL,
+        ).pack(anchor='w', pady=1)
+
+        footer = tk.Frame(frame, bg=C_PAGE)
+        footer.pack(fill='x', pady=(14, 0))
+        ttk.Separator(footer).pack(fill='x', pady=(0, 10))
+        btns = tk.Frame(footer, bg=C_PAGE)
+        btns.pack(anchor='e')
+        ttk.Button(btns, text="Cancelar", command=self.destroy).pack(side='left', padx=(0, 8))
+        ttk.Button(btns, text="Iniciar", style='Accent.TButton', command=self._start).pack(side='left')
+
+    def _browse_dir(self):
+        d = filedialog.askdirectory(title="Carpeta de destino", initialdir=self.dir_var.get() or None, parent=self)
+        if d:
+            self.dir_var.set(d)
+            self.error_lbl.config(text="")
+
+    def _start(self):
+        output_dir = self.dir_var.get().strip()
+        if not output_dir:
+            self.error_lbl.config(text="Elegí una carpeta de destino")
+            return
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+        except Exception as e:
+            self.error_lbl.config(text=f"No se pudo usar esa carpeta: {e}")
+            return
+        cb = self.on_start
+        subfolder = self.subfolder_var.get()
+        create_hash = self.hash_var.get()
+        self.destroy()
+        if cb:
+            cb(output_dir, subfolder, create_hash)
+
+
+class DownloadProgressDialog(tk.Toplevel):
+    """Ventana centrada que se abre al empezar una descarga (uno o
+    varios clips, con o sin audio) y se queda a la vista con el
+    progreso hasta que termina. Mientras descarga sólo se puede
+    cancelar; al terminar (OK, con fallidos, o cancelada) cambia a
+    'Ver Carpeta' / 'Crear Hash' / 'Cerrar' para encadenar el paso
+    siguiente sin tener que ir a buscar los botones de la ventana
+    principal."""
+
+    def __init__(self, parent, total: int, on_cancel=None,
+                 on_view_folder=None, on_create_hash=None):
+        super().__init__(parent)
+        _ensure_styles()
+        self.title("Descargando…")
+        self.configure(bg=C_PAGE)
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+
+        self.total = max(total, 1)
+        self.on_cancel = on_cancel
+        self.on_view_folder = on_view_folder
+        self.on_create_hash = on_create_hash
+
+        self._start_t = time.time()
+        self._current_index = 0
+        self._done = False
+        self._cancel_requested = False
+        self._output_path = None
+
+        self.container = tk.Frame(self, bg=C_PAGE, padx=18, pady=14)
+        self.container.pack(fill='both', expand=True)
+        self._build_progress_view()
+        center_window(self, parent)
+        self.protocol("WM_DELETE_WINDOW", self._on_close_attempt)
+        self._tick()
+
+    # -- construcción --------------------------------------------------
+    def _build_progress_view(self):
+        frame = self.container
+        for w in frame.winfo_children():
+            w.destroy()
+
+        tk.Label(frame, text="⬇ Descargando…", bg=C_PAGE, fg=C_TEXT,
+                 font=FONT_TITLE).pack(anchor='w', pady=(0, 10))
+
+        self.status_var = tk.StringVar(
+            value=f"Se están descargando 1 de {self.total}…" if self.total > 1 else "Descargando…")
+        tk.Label(frame, textvariable=self.status_var, bg=C_PAGE, fg=C_MUTED,
+                 font=FONT_BASE, wraplength=380, justify='left').pack(anchor='w', pady=(0, 8))
+
+        bar_row = tk.Frame(frame, bg=C_PAGE)
+        bar_row.pack(fill='x', pady=(0, 4))
+        self.progress_var = tk.DoubleVar(value=0)
+        self.progress_bar = ttk.Progressbar(
+            bar_row, orient='horizontal', mode='determinate',
+            variable=self.progress_var, maximum=100, length=340)
+        self.progress_bar.pack(side='left', fill='x', expand=True)
+        self.pct_var = tk.StringVar(value="0%")
+        tk.Label(bar_row, textvariable=self.pct_var, bg=C_PAGE, fg=C_MUTED,
+                 font=FONT_SMALL, width=5, anchor='e').pack(side='left', padx=(8, 0))
+
+        times_row = tk.Frame(frame, bg=C_PAGE)
+        times_row.pack(fill='x', pady=(6, 14))
+        self.start_var = tk.StringVar(value=f"Inicio: {datetime.now().strftime('%H:%M:%S')}")
+        self.eta_var = tk.StringVar(value="Estimado: calculando…")
+        self.elapsed_var = tk.StringVar(value="Transcurrido: 00m 00s")
+        for var in (self.start_var, self.eta_var, self.elapsed_var):
+            tk.Label(times_row, textvariable=var, bg=C_PAGE, fg=C_MUTED,
+                     font=FONT_SMALL).pack(anchor='w', pady=1)
+
+        footer = tk.Frame(frame, bg=C_PAGE)
+        footer.pack(fill='x')
+        ttk.Separator(footer).pack(fill='x', pady=(0, 10))
+        self.btns = tk.Frame(footer, bg=C_PAGE)
+        self.btns.pack(fill='x')
+        self.cancel_btn = ttk.Button(self.btns, text="Cancelar", command=self._request_cancel)
+        self.cancel_btn.pack(side='left')
+
+    # -- reloj de "tiempo transcurrido" / estimado -----------------------
+    def _tick(self):
+        if self._done:
+            return
+        elapsed = time.time() - self._start_t
+        self.elapsed_var.set(f"Transcurrido: {self._fmt_hms(elapsed)}")
+        if self._current_index > 0:
+            avg = elapsed / self._current_index
+            remaining = avg * (self.total - self._current_index)
+            self.eta_var.set(f"Estimado: {self._fmt_hms(remaining)} más")
+        self.after(500, self._tick)
+
+    @staticmethod
+    def _fmt_hms(seconds: float) -> str:
+        seconds = max(0, int(seconds))
+        h, rem = divmod(seconds, 3600)
+        m, s = divmod(rem, 60)
+        if h:
+            return f"{h:d}h {m:02d}m {s:02d}s"
+        return f"{m:02d}m {s:02d}s"
+
+    # -- llamado desde el hilo de descarga (vía root.after(0, ...)) -----
+    def update_item(self, index: int, total: int):
+        """`index` es 0-based: cuántos clips ya se completaron / cuál
+        se está descargando ahora."""
+        self._current_index = index
+        self.total = max(total, 1)
+        shown = min(index + 1, self.total)
+        if self.total > 1:
+            self.status_var.set(f"Se están descargando {shown} de {self.total}…")
+        else:
+            self.status_var.set("Descargando…")
+        pct = (index / self.total * 100) if self.total else 0
+        self.progress_var.set(pct)
+        self.pct_var.set(f"{pct:.0f}%")
+
+    def mark_done(self, ok: int, failed: int, cancelled: bool, output_path: Optional[str]):
+        self._done = True
+        self._output_path = output_path
+        self.progress_var.set(100)
+        self.pct_var.set("100%")
+        self.eta_var.set("Estimado: —")
+        self.elapsed_var.set(f"Transcurrido: {self._fmt_hms(time.time() - self._start_t)}")
+
+        if cancelled:
+            self.status_var.set(f"Cancelado. {ok} descargado(s), {failed} fallido(s)")
+        elif failed and not ok:
+            self.status_var.set(f"❌ Error: no se pudo descargar ({failed} fallido(s))")
+        elif failed:
+            self.status_var.set(f"✅ Descarga completa: {ok} OK, {failed} fallido(s)")
+        else:
+            self.status_var.set(f"✅ Descarga completa: {ok} de {self.total}")
+
+        for w in self.btns.winfo_children():
+            w.destroy()
+        if output_path and ok:
+            ttk.Button(self.btns, text="📂 Ver Carpeta", command=self._view_folder).pack(side='left')
+            ttk.Button(self.btns, text="🔑 Crear Hash", style='Accent.TButton',
+                       command=self._create_hash).pack(side='left', padx=(8, 0))
+        ttk.Button(self.btns, text="Cerrar", command=self.destroy).pack(side='right')
+
+    # -- acciones ---------------------------------------------------------
+    def _request_cancel(self):
+        if self._cancel_requested:
+            return
+        self._cancel_requested = True
+        self.cancel_btn.config(state='disabled', text="Cancelando…")
+        self.status_var.set("Cancelando…")
+        if self.on_cancel:
+            self.on_cancel()
+
+    def _view_folder(self):
+        if self.on_view_folder:
+            self.on_view_folder(self._output_path)
+
+    def _create_hash(self):
+        cb = self.on_create_hash
+        self.destroy()
+        if cb:
+            cb(self._output_path)
+
+    def _on_close_attempt(self):
+        if self._done:
+            self.destroy()
+            return
+        if messagebox.askyesno("Descarga en curso", "¿Cancelar la descarga en curso?", parent=self):
+            self._request_cancel()
+
+
+# ==========================================================================
 # Crear hash de archivos extraídos
 # ==========================================================================
 class HashDialog(tk.Toplevel):
@@ -1537,7 +1813,9 @@ class HashDialog(tk.Toplevel):
             self.destroy()
             return
         config.set_last_dir('last_report_dir', os.path.dirname(output))
+        self._write_reports(entries, algorithms, output, fmt)
 
+    def _write_reports(self, entries, algorithms, output, fmt):
         base, ext = os.path.splitext(output)
         written = []
         try:
@@ -1551,10 +1829,19 @@ class HashDialog(tk.Toplevel):
                 write_hash_report(entries, txt_path, algorithms=algorithms,
                                    source_description=self.target_path)
                 written.append(txt_path)
-        except ImportError as e:
-            messagebox.showerror(
+        except ImportError:
+            # Falta reportlab: ofrecemos instalarlo ahora mismo (pip,
+            # con el mismo intérprete que corre la app) en vez de sólo
+            # avisar y dejar al usuario ir a la consola.
+            if messagebox.askyesno(
                 "Falta una dependencia",
-                f"No se pudo generar el PDF:\n{e}", parent=self)
+                "Para generar el PDF hace falta el paquete 'reportlab' y no está "
+                "instalado.\n\n¿Instalarlo ahora automáticamente? "
+                "(requiere conexión a internet)",
+                parent=self,
+            ):
+                ReportlabInstallDialog(
+                    self, on_done=lambda: self._write_reports(entries, algorithms, output, fmt))
             return
         except OSError as e:
             messagebox.showerror("Error", f"No se pudo guardar el informe:\n{e}", parent=self)
@@ -1811,6 +2098,220 @@ class FFmpegInstallDialog(tk.Toplevel):
             ):
                 return
             self.cancel_event.set()
+            return
+        self.destroy()
+
+
+# ==========================================================================
+# Chequeo de dependencias Python opcionales al iniciar la app (Pillow,
+# OpenCV, reportlab). ffmpeg tiene su propio chequeo/instalador aparte
+# (ver _check_ffmpeg en gui/app.py y FFmpegInstallDialog más arriba).
+# ==========================================================================
+class DependencyCheckDialog(tk.Toplevel):
+    """Se muestra al iniciar si falta algún módulo opcional. Lista qué
+    falta y para qué se usa, con un check por módulo (todos tildados
+    por default), y permite instalarlos ahora con pip (mismo intérprete
+    que corre la app) antes de seguir usando la app."""
+
+    def __init__(self, parent, missing: List['deps_check.OptionalDep']):
+        super().__init__(parent)
+        _ensure_styles()
+        self.title("Módulos de la app")
+        self.configure(bg=C_PAGE)
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+
+        self.missing = missing
+        self._done = False
+        self.dep_vars = {d.pip_name: tk.BooleanVar(value=True) for d in missing}
+
+        self.container = tk.Frame(self, bg=C_PAGE, padx=18, pady=14)
+        self.container.pack(fill='both', expand=True)
+        self._build_list_view()
+        center_window(self, parent)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _fresh_container(self):
+        for w in self.winfo_children():
+            w.destroy()
+        container = tk.Frame(self, bg=C_PAGE, padx=18, pady=14)
+        container.pack(fill='both', expand=True)
+        return container
+
+    def _build_list_view(self):
+        frame = self.container
+        tk.Label(frame, text="Faltan módulos opcionales", bg=C_PAGE, fg=C_TEXT,
+                 font=FONT_TITLE).pack(anchor='w', pady=(0, 6))
+        tk.Label(
+            frame, bg=C_PAGE, fg=C_MUTED, font=FONT_BASE, wraplength=420, justify='left',
+            text="La app funciona igual sin ellos, pero algunas funciones no van a estar "
+                 "disponibles. Se pueden instalar ahora (pip) o más tarde a mano.",
+        ).pack(anchor='w', pady=(0, 12))
+
+        for dep in self.missing:
+            row = tk.Frame(frame, bg=C_PAGE)
+            row.pack(fill='x', pady=3, anchor='w')
+            tk.Checkbutton(
+                row, text=f"{dep.pip_name}", variable=self.dep_vars[dep.pip_name],
+                bg=C_PAGE, fg=C_TEXT, font=FONT_BOLD, activebackground=C_PAGE, selectcolor=C_PANEL,
+            ).pack(anchor='w')
+            tk.Label(
+                row, text=f"      → {dep.feature}", bg=C_PAGE, fg=C_MUTED,
+                font=FONT_SMALL, wraplength=400, justify='left',
+            ).pack(anchor='w')
+
+        if deps_check.is_frozen():
+            tk.Label(
+                frame, bg=C_PAGE, fg=C_DANGER, font=FONT_SMALL, wraplength=420, justify='left',
+                text="Esta es la versión empaquetada (.exe): no tiene pip para instalar "
+                     "en caliente. Hay que reconstruir el .exe con estos paquetes ya "
+                     "instalados en el entorno de build.",
+            ).pack(anchor='w', pady=(10, 0))
+
+        footer = tk.Frame(frame, bg=C_PAGE)
+        footer.pack(fill='x', pady=(14, 0))
+        ttk.Separator(footer).pack(fill='x', pady=(0, 10))
+        btns = tk.Frame(footer, bg=C_PAGE)
+        btns.pack(fill='x')
+        ttk.Button(btns, text="Omitir", command=self.destroy).pack(side='right')
+        self.install_btn = ttk.Button(
+            btns, text="Instalar seleccionados", style='Accent.TButton', command=self._start_install)
+        self.install_btn.pack(side='right', padx=(0, 8))
+        if deps_check.is_frozen():
+            self.install_btn.config(state='disabled')
+
+    def _start_install(self):
+        selected = [dep for dep in self.missing if self.dep_vars[dep.pip_name].get()]
+        if not selected:
+            self.destroy()
+            return
+        self._build_progress_view(selected)
+        threading.Thread(target=self._run_install, args=(selected,), daemon=True).start()
+
+    def _build_progress_view(self, selected):
+        frame = self._fresh_container()
+        self.container = frame
+        tk.Label(frame, text="Instalando módulos…", bg=C_PAGE, fg=C_TEXT,
+                 font=FONT_TITLE).pack(anchor='w', pady=(0, 10))
+        self.stage_var = tk.StringVar(value="Preparando...")
+        tk.Label(frame, textvariable=self.stage_var, bg=C_PAGE, fg=C_MUTED,
+                 font=FONT_BASE, wraplength=420, justify='left').pack(anchor='w', pady=(0, 10))
+        self.pb = ttk.Progressbar(frame, orient='horizontal', mode='indeterminate', length=420)
+        self.pb.pack(fill='x', pady=(0, 14))
+        self.pb.start(12)
+
+    def _run_install(self, selected):
+        pip_names = [d.pip_name for d in selected]
+        ok, failed = deps_check.install_packages(
+            pip_names, log_callback=lambda msg: self.after(0, lambda m=msg: self.stage_var.set(m)))
+        self.after(0, lambda: self._on_install_done(ok, failed))
+
+    def _on_install_done(self, ok, failed):
+        self._done = True
+        self.pb.stop()
+        frame = self._fresh_container()
+        if ok:
+            tk.Label(frame, text=f"✅ Instalado: {', '.join(ok)}", bg=C_PAGE, fg=C_TEXT,
+                     font=FONT_BOLD, wraplength=420, justify='left').pack(anchor='w', pady=(0, 6))
+        if failed:
+            tk.Label(frame, text=f"❌ No se pudo instalar: {', '.join(failed)}", bg=C_PAGE, fg=C_DANGER,
+                     font=FONT_BOLD, wraplength=420, justify='left').pack(anchor='w', pady=(0, 6))
+        if ok:
+            tk.Label(
+                frame, bg=C_PAGE, fg=C_MUTED, font=FONT_SMALL, wraplength=420, justify='left',
+                text="Reiniciá la app para que los módulos recién instalados queden disponibles.",
+            ).pack(anchor='w', pady=(4, 10))
+        footer = tk.Frame(frame, bg=C_PAGE)
+        footer.pack(fill='x', pady=(10, 0))
+        ttk.Button(footer, text="Cerrar", style='Accent.TButton', command=self.destroy).pack(anchor='e')
+
+    def _on_close(self):
+        self.destroy()
+
+
+# ==========================================================================
+# Instalación en caliente de 'reportlab' (dependencia opcional para el
+# informe de Hashear en PDF)
+# ==========================================================================
+class ReportlabInstallDialog(tk.Toplevel):
+    """Pantalla simple: confirmación → 'pip install reportlab' corriendo
+    en un hilo de fondo (progreso indeterminado, pip no da bytes/porcentaje)
+    → éxito o error. Al tener éxito llama a `on_done` (normalmente,
+    reintentar la generación del PDF que había fallado)."""
+
+    def __init__(self, parent, on_done=None):
+        super().__init__(parent)
+        _ensure_styles()
+        self.title("Instalar reportlab")
+        self.configure(bg=C_PAGE)
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+
+        self.on_done = on_done
+        self._done = False
+
+        self.container = tk.Frame(self, bg=C_PAGE, padx=18, pady=14)
+        self.container.pack(fill='both', expand=True)
+        self._build_view()
+        center_window(self, parent)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        threading.Thread(target=self._run_install, daemon=True).start()
+
+    def _fresh_container(self):
+        for w in self.winfo_children():
+            w.destroy()
+        container = tk.Frame(self, bg=C_PAGE, padx=18, pady=14)
+        container.pack(fill='both', expand=True)
+        return container
+
+    def _build_view(self):
+        frame = self.container
+        tk.Label(frame, text="Instalando reportlab…", bg=C_PAGE, fg=C_TEXT,
+                 font=FONT_TITLE).pack(anchor='w', pady=(0, 10))
+        self.stage_var = tk.StringVar(value="pip install reportlab")
+        tk.Label(frame, textvariable=self.stage_var, bg=C_PAGE, fg=C_MUTED,
+                 font=FONT_BASE, wraplength=380, justify='left').pack(anchor='w', pady=(0, 10))
+        self.pb = ttk.Progressbar(frame, orient='horizontal', mode='indeterminate', length=380)
+        self.pb.pack(fill='x', pady=(0, 14))
+        self.pb.start(12)
+        ttk.Button(frame, text="Cerrar", command=self._on_close).pack(anchor='e')
+
+    def _run_install(self):
+        try:
+            install_reportlab(log_callback=lambda msg: self.after(0, lambda: self.stage_var.set(msg)))
+            self.after(0, self._on_success)
+        except ReportlabInstallError as e:
+            self.after(0, lambda msg=str(e): self._on_error(msg))
+        except Exception as e:
+            log.exception("Error inesperado instalando reportlab")
+            self.after(0, lambda msg=str(e): self._on_error(msg))
+
+    def _on_success(self):
+        self._done = True
+        frame = self._fresh_container()
+        tk.Label(frame, text="✅ reportlab instalado correctamente", bg=C_PAGE, fg=C_TEXT,
+                 font=FONT_TITLE).pack(anchor='w', pady=(0, 14))
+        ttk.Button(frame, text="Listo", style='Accent.TButton',
+                   command=self.destroy).pack(anchor='e')
+        if self.on_done:
+            self.on_done()
+
+    def _on_error(self, msg: str):
+        self._done = True
+        messagebox.showerror(
+            "No se pudo instalar reportlab",
+            f"{msg}\n\nPodés instalarlo a mano abriendo una consola y corriendo:\n"
+            f"    pip install reportlab",
+            parent=self)
+        self.destroy()
+
+    def _on_close(self):
+        if not self._done:
+            # La instalación de pip corre en el hilo de fondo igual;
+            # sólo cerramos la ventana, no la matamos a mitad de camino.
+            self.destroy()
             return
         self.destroy()
 

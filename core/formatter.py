@@ -28,7 +28,15 @@ from typing import Callable, Optional
 
 IS_WINDOWS = sys.platform.startswith('win')
 
-DEFAULT_CLUSTER_SIZE = 32 * 1024  # 32 KiB: tamaño típico de cluster FAT32 en SD de varios GB
+DEFAULT_CLUSTER_SIZE = 4 * 1024 * 1024  # 4 MiB: bloque de escritura grande.
+# Nota: esto NO es el "cluster" real del sistema de archivos FAT32 (típ.
+# 32 KiB) — es sólo el tamaño del buffer que se escribe por syscall.
+# Con SD/USB reales, escribir en bloques de 32 KiB deja el proceso
+# limitado por la cantidad de syscalls (miles de write() por GB) en vez
+# de por la velocidad real del dispositivo. Con bloques de varios MiB
+# se llega mucho más cerca de la velocidad de escritura sostenida real
+# de la tarjeta. El usuario puede seguir ajustando este tamaño desde
+# el diálogo de Formatear si lo necesita.
 
 
 class FormatError(Exception):

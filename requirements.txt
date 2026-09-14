@@ -5,7 +5,8 @@ opencv-python-headless
 pillow
 
 # Opcional, sólo para generar el informe de Hashear en PDF (si no está
-# instalado, igual se puede generar el informe en TXT):
+# instalado, igual se puede generar el informe en TXT). Si falta, la
+# app ahora ofrece instalarlo sola con pip desde el diálogo de Hashear:
 reportlab
 
 # Además, ffmpeg y ffprobe deben estar disponibles en el PATH del

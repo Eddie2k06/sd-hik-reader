@@ -2,11 +2,11 @@
 
 
 a = Analysis(
-    ['C:/Pythons/sd_3\\main.py'],
+    ['D:/Proyectos PY/sd-hik-reader-main/sd-hik-reader-main/main.py'],
     pathex=[],
     binaries=[],
-    datas=[('C:/Pythons/sd_3\\README.md', '.'), ('C:/Pythons/sd_3\\core', 'core'), ('C:/Pythons/sd_3\\gui', 'gui'), ('C:/Pythons/sd_3\\requirements.txt', '.'), ('C:/Pythons/sd_3\\sd-card.ico', '.'), ('C:/Pythons/sd_3\\sd_3.zip', '.')],
-    hiddenimports=['reportlab.graphics.barcode'],
+    datas=[],
+    hiddenimports=[],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -22,7 +22,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='SD_READER',
+    name='EZVIZ-Extractor',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -35,5 +35,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['C:\\Pythons\\sd_3\\sd-card.ico'],
+    icon=['D:\\Proyectos PY\\sd-hik-reader-main\\sd-hik-reader-main\\sd-card.ico'],
 )

@@ -9,6 +9,8 @@ los métodos que usan tanto los botones como los ítems de menú.
 
 import logging
 import os
+import subprocess
+import sys
 import threading
 import tkinter as tk
 from datetime import datetime
@@ -20,7 +22,7 @@ from core import ffmpeg_setup
 from core import sd_check
 from core.parser import EZVIZIndexParser, EZVIZParseError, Segment
 from gui.menu import build_menu
-from gui.dialogs import C_PAGE, _ensure_styles
+from gui.dialogs import C_PAGE, DownloadOptionsDialog, DownloadProgressDialog, _ensure_styles
 
 log = logging.getLogger("ezviz_reader.app")
 
@@ -95,7 +97,9 @@ class SDReaderApp:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         # Se dispara con un pequeño delay para que la ventana principal
-        # ya esté dibujada antes de mostrar el aviso/diálogo de ffmpeg.
+        # ya esté dibujada antes de mostrar el aviso/diálogo de módulos
+        # faltantes y, después, el de ffmpeg.
+        self.root.after(150, self._check_dependencies)
         self.root.after(200, self._check_ffmpeg)
 
     # ----------------------------------------------------------------
@@ -125,6 +129,18 @@ class SDReaderApp:
             'show_detail': self.show_detail.get(),
         }
         cfgmod.save_config(cfg)
+
+    def _check_dependencies(self):
+        """Al iniciar: chequea si están los módulos Python opcionales
+        (Pillow, OpenCV, reportlab) y, si falta alguno, ofrece
+        instalarlos con pip antes de seguir. ffmpeg se chequea aparte,
+        en _check_ffmpeg, porque no es un paquete de pip."""
+        from core import deps_check
+        missing = deps_check.check_missing()
+        if not missing:
+            return
+        from gui.dialogs import DependencyCheckDialog
+        DependencyCheckDialog(self.root, missing)
 
     def _check_ffmpeg(self):
         """Al iniciar: si no se encuentra ffmpeg (ni en el PATH ni en
@@ -191,13 +207,13 @@ class SDReaderApp:
         self.filter_frame = ttk.LabelFrame(self.root, text="Filtros de Fecha", padding=10)
         ttk.Label(self.filter_frame, text="Desde:").pack(side='left')
         self.from_date = tk.StringVar(value="")
-        ttk.Entry(self.filter_frame, textvariable=self.from_date, width=18).pack(side='left', padx=5)
+        ttk.Entry(self.filter_frame, textvariable=self.from_date, width=10).pack(side='left', padx=5)
         ttk.Label(self.filter_frame, text="Hasta:").pack(side='left')
         self.to_date = tk.StringVar(value="")
-        ttk.Entry(self.filter_frame, textvariable=self.to_date, width=18).pack(side='left', padx=5)
+        ttk.Entry(self.filter_frame, textvariable=self.to_date, width=10).pack(side='left', padx=5)
         ttk.Button(self.filter_frame, text="🔄 Filtrar", command=self.apply_filter).pack(side='left', padx=5)
         ttk.Button(self.filter_frame, text="❌ Limpiar", command=self.clear_filter).pack(side='left')
-        ttk.Label(self.filter_frame, text="(Formato: YYYY-MM-DD HH:MM:SS)").pack(side='left', padx=10)
+        ttk.Label(self.filter_frame, text="(Formato: dd/mm/aa)").pack(side='left', padx=10)
 
         # Empaquetar los paneles opcionales según su estado inicial
         self._relayout_optional_panels()
@@ -377,6 +393,28 @@ class SDReaderApp:
                     self.thumb_btn, self.batch_btn, self.preview_btn):
             btn.config(state=state)
         self.cancel_btn.config(state='normal' if busy else 'disabled')
+
+    def open_path_in_explorer(self, path: Optional[str]):
+        """Abre el explorador de archivos del sistema en `path` (si es
+        una carpeta) o en la carpeta que contiene `path` (si es un
+        archivo). Usado desde la ventana flotante de descarga ('Ver
+        Carpeta') una vez que termina."""
+        if not path:
+            return
+        target = path if os.path.isdir(path) else os.path.dirname(path)
+        if not target or not os.path.isdir(target):
+            return
+        try:
+            if sys.platform.startswith('win'):
+                os.startfile(target)  # noqa: S606 (sólo Windows)
+            elif sys.platform == 'darwin':
+                subprocess.Popen(['open', target])
+            else:
+                subprocess.Popen(['xdg-open', target])
+        except Exception as e:
+            log.warning("No se pudo abrir la carpeta %s: %s", target, e)
+            messagebox.showwarning(
+                "Atención", f"No se pudo abrir la carpeta:\n{target}", parent=self.root)
 
     # ----------------------------------------------------------------
     # Menú "SD": selección de origen y carga
@@ -721,21 +759,39 @@ class SDReaderApp:
     # ----------------------------------------------------------------
     # Filtro de fechas
     # ----------------------------------------------------------------
+    # Formatos de fecha-sola aceptados en los campos "Desde"/"Hasta"
+    # del filtro (se prueban en orden). dd/mm/aa es el formato que se
+    # muestra como ejemplo junto a los campos.
+    _FILTER_DATE_FORMATS = ('%d/%m/%y', '%d/%m/%Y', '%d-%m-%y', '%d-%m-%Y')
+
+    @classmethod
+    def _parse_filter_date(cls, text: str, end_of_day: bool = False) -> Optional[datetime]:
+        """Parsea una fecha-sola (sin hora) de los campos de filtro.
+        `end_of_day` corre la fecha resultante a las 23:59:59 para que
+        'Hasta' incluya todo ese día en vez de cortar a las 00:00."""
+        text = text.strip()
+        if not text:
+            return None
+        for fmt in cls._FILTER_DATE_FORMATS:
+            try:
+                dt = datetime.strptime(text, fmt)
+                if end_of_day:
+                    dt = dt.replace(hour=23, minute=59, second=59)
+                return dt
+            except ValueError:
+                continue
+        raise ValueError(text)
+
     def apply_filter(self):
         if not self.parser:
             messagebox.showwarning("Atención", "Cargá una tarjeta primero")
             return
 
         try:
-            from_time = None
-            to_time = None
+            from_time = self._parse_filter_date(self.from_date.get())
+            to_time = self._parse_filter_date(self.to_date.get(), end_of_day=True)
 
-            if self.from_date.get().strip():
-                from_time = datetime.strptime(self.from_date.get().strip(), '%Y-%m-%d %H:%M:%S')
-            if self.to_date.get().strip():
-                to_time = datetime.strptime(self.to_date.get().strip(), '%Y-%m-%d %H:%M:%S')
-
-            if from_time and to_time and from_time >= to_time:
+            if from_time and to_time and from_time > to_time:
                 messagebox.showerror("Error", "'Desde' debe ser anterior a 'Hasta'")
                 return
 
@@ -746,7 +802,7 @@ class SDReaderApp:
             self.status_label.config(text=f"Filtrados: {len(self.segments)} segmentos")
 
         except ValueError:
-            messagebox.showerror("Error", "Formato de fecha inválido. Usá: YYYY-MM-DD HH:MM:SS")
+            messagebox.showerror("Error", "Formato de fecha inválido. Usá: dd/mm/aa")
 
     def clear_filter(self):
         self.from_date.set("")
@@ -770,8 +826,9 @@ class SDReaderApp:
 
     def download_selected(self, with_audio: bool = False):
         """Descarga los clips seleccionados en el treeview (uno o varios).
-        Con un solo clip pide un nombre de archivo; con varios, pide una
-        carpeta de destino y usa un nombre automático por clip."""
+        Con un solo clip pide un nombre de archivo directamente; con
+        varios, abre el diálogo de opciones (carpeta, subcarpeta por
+        fecha, hash automático) antes de arrancar."""
         segs = self._get_selected_segments()
         if not segs:
             messagebox.showwarning("Atención", "Seleccioná uno o más clips primero")
@@ -790,17 +847,41 @@ class SDReaderApp:
                 return
             self._run_download(segs, with_audio, single_output=output)
         else:
-            output_dir = filedialog.askdirectory(
-                title=f"Carpeta de destino para {len(segs)} clips",
-                initialdir=self.last_extract_dir or None)
-            if not output_dir:
-                return
-            self._run_download(segs, with_audio, output_dir=output_dir)
+            self._open_download_options(segs, with_audio)
+
+    def _open_download_options(self, segs: list, with_audio: bool = False):
+        """Abre el diálogo de opciones previo a la descarga (pedido #2):
+        cuántos de cuántos, rango de fechas, carpeta de destino,
+        subcarpeta por fecha y hash automático al terminar."""
+        dates = [s.startTimeDt for s in segs]
+        date_min, date_max = min(dates), max(dates)
+
+        def on_start(output_dir: str, subfolder_by_date: bool, create_hash: bool):
+            self._run_download(
+                segs, with_audio, output_dir=output_dir,
+                subfolder_by_date=subfolder_by_date, auto_hash=create_hash)
+
+        DownloadOptionsDialog(
+            self.root,
+            total_to_download=len(segs),
+            total_loaded=len(self.segments) or len(segs),
+            date_min=date_min, date_max=date_max,
+            initial_dir=self.last_extract_dir or "",
+            on_start=on_start,
+        )
 
     def _run_download(self, segs: list, with_audio: bool,
-                       single_output: Optional[str] = None, output_dir: Optional[str] = None):
+                       single_output: Optional[str] = None, output_dir: Optional[str] = None,
+                       subfolder_by_date: bool = False, auto_hash: bool = False):
         self.cancel_batch.clear()
         total = len(segs)
+
+        dlg = DownloadProgressDialog(
+            self.root, total=total,
+            on_cancel=self.cancel_extraction,
+            on_view_folder=self.open_path_in_explorer,
+            on_create_hash=lambda _path=None: self.open_hash_dialog(),
+        )
 
         def do_download():
             self.set_buttons_busy(True)
@@ -813,13 +894,18 @@ class SDReaderApp:
                 try:
                     self.set_status(f"Descargando {i + 1}/{total}...")
                     self.set_progress((i / total) * 100)
+                    self.root.after(0, lambda i=i: dlg.update_item(i, total))
 
                     if single_output is not None:
                         dest = single_output
                     else:
                         suffix = '_audio' if with_audio else ''
+                        dest_dir = output_dir
+                        if subfolder_by_date:
+                            dest_dir = os.path.join(output_dir, seg.startTimeDt.strftime('%Y-%m-%d'))
+                            os.makedirs(dest_dir, exist_ok=True)
                         dest = os.path.join(
-                            output_dir, f"clip_{seg.startTimeDt.strftime('%Y%m%d_%H%M%S')}{suffix}.mp4")
+                            dest_dir, f"clip_{seg.startTimeDt.strftime('%Y%m%d_%H%M%S')}{suffix}.mp4")
 
                     if with_audio:
                         self.parser.extract_segment_mp4_with_audio(seg, dest)
@@ -837,22 +923,22 @@ class SDReaderApp:
             self.set_progress(100)
             self.set_buttons_busy(False)
 
-            if self.cancel_batch.is_set():
+            cancelled = self.cancel_batch.is_set()
+            result_path = self.last_extract_dir or last_path
+            if cancelled:
                 self.set_status(f"Cancelado. {ok} descargados, {failed} fallidos")
-                self.root.after(0, lambda: messagebox.showinfo(
-                    "Cancelado", f"Descarga cancelada.\nOK: {ok}  Fallidos: {failed}"))
-            elif total == 1:
-                if ok:
-                    self.set_status(f"✅ Guardado: {last_path}")
-                    self.root.after(0, lambda: messagebox.showinfo("Éxito", f"Clip extraído:\n{last_path}"))
-                else:
-                    self.set_status("❌ Error")
-                    self.root.after(0, lambda: messagebox.showerror("Error", "No se pudo extraer el clip"))
-            else:
+            elif failed and not ok:
+                self.set_status("❌ Error")
+            elif failed:
                 self.set_status(f"✅ Descarga completa: {ok} OK, {failed} fallidos")
-                self.root.after(0, lambda: messagebox.showinfo(
-                    "Éxito", f"Se descargaron {ok} de {total} clips"
-                    + (f"\n({failed} fallaron, ver consola)" if failed else "")))
+            else:
+                self.set_status(f"✅ Descarga completa: {ok} de {total}")
+            self.root.after(0, lambda: dlg.mark_done(ok, failed, cancelled, result_path))
+            if auto_hash and ok:
+                # Se abre el asistente de hash automáticamente sobre la
+                # carpeta recién descargada, sin esperar a que el
+                # usuario apriete "Crear Hash" a mano.
+                self.root.after(400, self.open_hash_dialog)
 
         threading.Thread(target=do_download, daemon=True).start()
 
@@ -898,50 +984,7 @@ class SDReaderApp:
         if not self.segments:
             messagebox.showwarning("Atención", "No hay clips cargados")
             return
-
-        output_dir = filedialog.askdirectory(title="Carpeta de destino", initialdir=self.last_extract_dir or None)
-        if not output_dir:
-            return
-
-        self.cancel_batch.clear()
-
-        def do_extract_all():
-            self.set_buttons_busy(True)
-            total = len(self.segments)
-            ok, failed = 0, 0
-
-            for i, seg in enumerate(self.segments):
-                if self.cancel_batch.is_set():
-                    break
-                try:
-                    self.set_status(f"Extrayendo {i + 1}/{total}...")
-                    self.set_progress((i / total) * 100)
-
-                    filename = os.path.join(
-                        output_dir, f"clip_{seg.startTimeDt.strftime('%Y%m%d_%H%M%S')}.mp4"
-                    )
-                    self.parser.extract_segment_mp4(seg, filename)
-                    ok += 1
-                except Exception as e:
-                    log.warning("Error en segmento %s: %s", i, e)
-                    failed += 1
-
-            self.last_extract_dir = output_dir
-            cfgmod.set_last_dir('last_extract_dir', output_dir)
-            self.set_progress(100)
-            self.set_buttons_busy(False)
-
-            if self.cancel_batch.is_set():
-                self.set_status(f"Cancelado. {ok} extraídos, {failed} fallidos")
-                self.root.after(0, lambda: messagebox.showinfo(
-                    "Cancelado", f"Extracción cancelada.\nOK: {ok}  Fallidos: {failed}"))
-            else:
-                self.set_status(f"✅ Extracción completa: {ok} OK, {failed} fallidos")
-                self.root.after(0, lambda: messagebox.showinfo(
-                    "Éxito", f"Se extrajeron {ok} de {total} clips a:\n{output_dir}"
-                    + (f"\n({failed} fallaron, ver consola)" if failed else "")))
-
-        threading.Thread(target=do_extract_all, daemon=True).start()
+        self._open_download_options(list(self.segments), with_audio=False)
 
     # ----------------------------------------------------------------
     # Vista previa embebida

@@ -12,12 +12,17 @@ de custodia; el resto son opcionales.
 """
 
 import hashlib
+import logging
 import os
+import subprocess
+import sys
 import time
 import zlib
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, List, Optional, Sequence
+
+log = logging.getLogger("ezviz_reader.hashing")
 
 ALL_ALGORITHMS = ('sha256', 'sha1', 'md5', 'sha512', 'crc32')
 DEFAULT_ALGORITHMS = ('sha256',)
@@ -256,6 +261,94 @@ def write_hash_report(
         f.write(f"Fin del informe — {len(entries)} archivo(s) procesado(s)\n")
 
     return output_path
+
+
+def reportlab_available() -> bool:
+    """Chequeo rápido, sin efectos secundarios, de si ya se puede
+    generar el PDF (reportlab importable en este intérprete)."""
+    try:
+        import reportlab  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+class ReportlabInstallError(Exception):
+    pass
+
+
+def install_reportlab(log_callback: Optional[Callable[[str], None]] = None) -> None:
+    """Instala `reportlab` en caliente vía pip, usando el mismo
+    intérprete que corre la app (sys.executable -m pip). Pensado para
+    llamarse desde un hilo de fondo (la instalación tarda unos
+    segundos y no debe bloquear la UI).
+
+    `log_callback`, si se pasa, recibe líneas de texto de progreso
+    (ej. para mostrarlas en un cuadro de estado).
+
+    Levanta ReportlabInstallError con un mensaje legible si la
+    instalación falla (sin conexión, pip no disponible, entorno
+    de sólo lectura, etc.). No hace nada si reportlab ya está
+    instalado.
+    """
+    if reportlab_available():
+        return
+
+    if getattr(sys, 'frozen', False):
+        # Ejecutable empaquetado (PyInstaller): sys.executable es el
+        # .exe de la app, no un intérprete de Python con pip. No hay
+        # forma de instalar un paquete nuevo en caliente acá; hace
+        # falta reconstruir el .exe con reportlab ya instalado en el
+        # entorno de build (pip install reportlab + volver a generar
+        # con SD_READER.spec) o correr la app desde código fuente.
+        raise ReportlabInstallError(
+            "Esta es la versión empaquetada (.exe) de la app, que no tiene pip "
+            "disponible para instalar paquetes nuevos en caliente.\n\n"
+            "Para poder generar el PDF hay que volver a compilar el ejecutable "
+            "después de instalar reportlab en el entorno de build:\n"
+            "    pip install reportlab\n"
+            "    pyinstaller SD_READER.spec\n\n"
+            "Como alternativa, mientras tanto se puede generar el informe en TXT."
+        )
+
+    def notify(msg: str):
+        log.info(msg)
+        if log_callback:
+            log_callback(msg)
+
+    notify("Instalando reportlab (pip install reportlab)…")
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check", "reportlab"],
+            capture_output=True, text=True, timeout=180,
+        )
+    except FileNotFoundError as e:
+        raise ReportlabInstallError(
+            f"No se encontró el intérprete de Python para instalar el paquete "
+            f"({sys.executable}). Instalá reportlab manualmente: pip install reportlab"
+        ) from e
+    except subprocess.TimeoutExpired as e:
+        raise ReportlabInstallError(
+            "La instalación tardó demasiado (¿sin conexión a internet?). "
+            "Probá instalarlo manualmente: pip install reportlab"
+        ) from e
+
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()[-800:]
+        raise ReportlabInstallError(
+            "pip no pudo instalar reportlab. Detalle:\n" + (detail or "(sin salida)")
+        )
+
+    # invalidar caches de import para que este mismo proceso vea el
+    # paquete recién instalado sin necesidad de reiniciar la app.
+    import importlib
+    importlib.invalidate_caches()
+    if not reportlab_available():
+        raise ReportlabInstallError(
+            "pip terminó sin error pero el paquete sigue sin poder importarse. "
+            "Puede que haga falta reiniciar la app."
+        )
+    notify("reportlab instalado correctamente.")
 
 
 def write_hash_report_pdf(
